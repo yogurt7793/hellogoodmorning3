@@ -1,25 +1,31 @@
-"""책모아 메인: 캐릭터 이동형 도서관.
 
-실행: streamlit run main.py
-pages/1_숏폼_브레이커.py를 포함한 멀티페이지 프로젝트.
-HTML·CSS·JavaScript·외부 API 사용 없음.
-"""
-import json
+"""책모아 메인 도서관: 캐릭터 이동, 독서 기록, 책갈피 PNG, 간단 계정 로그인."""
+import hashlib
+import hmac
+import os
+import re
+import sqlite3
 from io import BytesIO
 from pathlib import Path
 
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 
-st.set_page_config(page_title="책모아 | 도서관", page_icon="📚", layout="wide")
+st.set_page_config(
+    page_title="책모아 도서관", page_icon="📚", layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-STATIONS = ["한줄평", "독후감", "책갈피"]
-PALETTES = {
-    "크림": ("#F7EFDE", "#78533C", "#453527"),
-    "민트": ("#E1F1E9", "#3A7565", "#24473C"),
-    "라벤더": ("#EEE9F7", "#725A9B", "#44375F"),
+ROOT = Path(__file__).resolve().parent
+DB_FILE = ROOT / ".bookmoa" / "records.db"
+ZONES = ["한줄평", "독후감", "책갈피"]
+ICONS = ["✍️", "📝", "🔖"]
+THEMES = {
+    "크림": ("#FAEED8", "#976A51", "#49362B"),
+    "민트": ("#E4F5ED", "#467F72", "#264A40"),
+    "라벤더": ("#EEE9F9", "#7F67A8", "#423653"),
 }
-FONT_PATHS = [
+FONT_FILES = [
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
     "C:/Windows/Fonts/malgun.ttf",
@@ -27,340 +33,1056 @@ FONT_PATHS = [
 ]
 
 
+# ────────── 데이터베이스 / 로그인 ──────────
+def connect_db():
+    DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+    return sqlite3.connect(str(DB_FILE), timeout=10)
+
+
+def init_db():
+    with connect_db() as db:
+        db.execute("""CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            salt BLOB NOT NULL, password_hash BLOB NOT NULL
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS books (
+            user_id INTEGER NOT NULL, book_key TEXT NOT NULL,
+            title TEXT NOT NULL, author TEXT NOT NULL,
+            PRIMARY KEY(user_id, book_key)
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS reviews (
+            user_id INTEGER NOT NULL, book_key TEXT NOT NULL,
+            rating INTEGER NOT NULL, content TEXT NOT NULL,
+            PRIMARY KEY(user_id, book_key)
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS reports (
+            user_id INTEGER NOT NULL, book_key TEXT NOT NULL,
+            reason TEXT NOT NULL, scene TEXT NOT NULL, thought TEXT NOT NULL,
+            PRIMARY KEY(user_id, book_key)
+        )""")
+
+
+def password_digest(password, salt):
+    return hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, 300_000
+    )
+
+
+def register_user(username, password):
+    if not re.fullmatch(r"[A-Za-z0-9_]{3,20}", username):
+        return "아이디는 영문·숫자·_를 사용해 3~20자로 입력하세요."
+    if len(password) < 8:
+        return "비밀번호는 8자 이상 입력하세요."
+    salt = os.urandom(16)
+    try:
+        with connect_db() as db:
+            db.execute(
+                "INSERT INTO users(username,salt,password_hash) VALUES(?,?,?)",
+                (username, salt, password_digest(password, salt)),
+            )
+    except sqlite3.IntegrityError:
+        return "이미 사용 중인 아이디입니다."
+    return None
+
+
+def authenticate(username, password):
+    with connect_db() as db:
+        row = db.execute(
+            "SELECT id,salt,password_hash FROM users WHERE username=?",
+            (username,)
+        ).fetchone()
+    if row and hmac.compare_digest(
+        password_digest(password, row[1]), row[2]
+    ):
+        return row[0]
+    return None
+
+
+def load_records(user_id):
+    with connect_db() as db:
+        book_rows = db.execute(
+            "SELECT book_key,title,author FROM books WHERE user_id=?",
+            (user_id,)
+        ).fetchall()
+        review_rows = db.execute(
+            "SELECT book_key,rating,content FROM reviews WHERE user_id=?",
+            (user_id,)
+        ).fetchall()
+        report_rows = db.execute(
+            "SELECT book_key,reason,scene,thought FROM reports WHERE user_id=?",
+            (user_id,)
+        ).fetchall()
+    st.session_state.bm_books = {
+        k: {"title": title, "author": author}
+        for k, title, author in book_rows
+    }
+    st.session_state.bm_reviews = {
+        k: {"rating": rating, "text": content}
+        for k, rating, content in review_rows
+    }
+    st.session_state.bm_reports = {
+        k: {"reason": a, "scene": b, "thought": c}
+        for k, a, b, c in report_rows
+    }
+    st.session_state.bm_current = next(
+        iter(st.session_state.bm_books), None
+    )
+    st.session_state.bm_png = None
+
+
+def save_book(user_id, key, title, author):
+    if user_id is None:
+        return
+    with connect_db() as db:
+        db.execute(
+            "INSERT OR REPLACE INTO books VALUES(?,?,?,?)",
+            (user_id, key, title, author),
+        )
+
+
+def save_review(user_id, key, rating, content):
+    if user_id is None:
+        return
+    with connect_db() as db:
+        db.execute(
+            "INSERT OR REPLACE INTO reviews VALUES(?,?,?,?)",
+            (user_id, key, rating, content),
+        )
+
+
+def save_report(user_id, key, reason, scene, thought):
+    if user_id is None:
+        return
+    with connect_db() as db:
+        db.execute(
+            "INSERT OR REPLACE INTO reports VALUES(?,?,?,?,?)",
+            (user_id, key, reason, scene, thought),
+        )
+
+
+def delete_record(table, user_id, key):
+    if user_id is None:
+        return
+    if table not in ("reviews", "reports"):
+        return
+    with connect_db() as db:
+        db.execute(
+            f"DELETE FROM {table} WHERE user_id=? AND book_key=?",
+            (user_id, key)
+        )
+
+
+# ────────── 그림 생성 ──────────
 def korean_font(size):
-    """운영체제에 있는 한글 폰트를 탐색한다."""
-    for path in FONT_PATHS:
-        if Path(path).exists():
-            return ImageFont.truetype(path, size)
-    return ImageFont.load_default()
+    for p in FONT_FILES:
+        if Path(p).is_file():
+            return ImageFont.truetype(p, size)
+    raise ValueError(
+        "한글 글꼴이 없습니다. 저장소에 packages.txt를 추가해 주세요."
+    )
 
 
-def draw_center(draw, text, center_x, y, font, fill):
-    bbox = draw.textbbox((0, 0), text, font=font)
-    draw.text((center_x - (bbox[2] - bbox[0]) / 2, y), text, font=font, fill=fill)
+def centered_text(draw, text, x, y, font, color):
+    box = draw.textbbox((0, 0), text, font=font)
+    draw.text(
+        (x - (box[2] - box[0]) / 2, y),
+        text, font=font, fill=color
+    )
 
 
-def wrap_pixels(draw, text, font, max_width):
-    """한글과 영문을 픽셀 너비에 맞춰 줄바꿈한다."""
+def text_lines(draw, text, font, width):
     lines, part = [], ""
-    for ch in text:
-        if ch == "\n":
+    for char in text:
+        if char == "\n":
             lines.append(part)
             part = ""
-        elif draw.textbbox((0, 0), part + ch, font=font)[2] <= max_width:
-            part += ch
+        elif draw.textbbox(
+            (0, 0), part + char, font=font
+        )[2] <= width:
+            part += char
         else:
             if part:
                 lines.append(part)
-            part = ch
+            part = char
     if part:
         lines.append(part)
     return lines
 
 
+def cute_character(draw, cx, base_y):
+    """큰 얼굴, 토끼 귀, 볼터치가 있는 책 요정 캐릭터."""
+    # 그림자와 발
+    draw.ellipse(
+        (cx - 42, base_y - 8, cx + 43, base_y + 6),
+        fill="#C3B1AA"
+    )
+    draw.ellipse(
+        (cx - 32, base_y - 25, cx - 3, base_y + 2),
+        fill="#7E658C"
+    )
+    draw.ellipse(
+        (cx + 4, base_y - 25, cx + 34, base_y + 2),
+        fill="#7E658C"
+    )
+
+    # 몸과 작은 책
+    draw.rounded_rectangle(
+        (cx - 38, base_y - 97, cx + 38, base_y - 18),
+        radius=28, fill="#A28BDD"
+    )
+    draw.rounded_rectangle(
+        (cx - 27, base_y - 75, cx + 25, base_y - 39),
+        radius=6, fill="#FFE9B4",
+        outline="#8A6A58", width=2
+    )
+    draw.line(
+        (cx, base_y - 74, cx, base_y - 40),
+        fill="#D9AF82", width=2
+    )
+    draw.ellipse(
+        (cx - 46, base_y - 77, cx - 28, base_y - 57),
+        fill="#FFD4BB"
+    )
+    draw.ellipse(
+        (cx + 28, base_y - 77, cx + 46, base_y - 57),
+        fill="#FFD4BB"
+    )
+
+    # 토끼 머리띠
+    draw.ellipse(
+        (cx - 32, base_y - 172, cx - 7, base_y - 110),
+        fill="#F5EAF7", outline="#9B86B0", width=2
+    )
+    draw.ellipse(
+        (cx + 7, base_y - 172, cx + 32, base_y - 110),
+        fill="#F5EAF7", outline="#9B86B0", width=2
+    )
+    draw.ellipse(
+        (cx - 26, base_y - 161, cx - 13, base_y - 119),
+        fill="#F3B5CC"
+    )
+    draw.ellipse(
+        (cx + 13, base_y - 161, cx + 26, base_y - 119),
+        fill="#F3B5CC"
+    )
+
+    # 머리와 얼굴
+    draw.ellipse(
+        (cx - 51, base_y - 147, cx + 51, base_y - 63),
+        fill="#4A3A41"
+    )
+    draw.ellipse(
+        (cx - 46, base_y - 143, cx + 46, base_y - 63),
+        fill="#FFD9C3"
+    )
+    draw.pieslice(
+        (cx - 46, base_y - 149, cx + 47, base_y - 79),
+        170, 360, fill="#4A3A41"
+    )
+
+    # 눈과 반짝임
+    for ex in (cx - 19, cx + 19):
+        draw.ellipse(
+            (ex - 6, base_y - 104, ex + 6, base_y - 89),
+            fill="#27202A"
+        )
+        draw.ellipse(
+            (ex - 2, base_y - 102, ex + 1, base_y - 99),
+            fill="white"
+        )
+
+    # 볼터치와 입
+    draw.ellipse(
+        (cx - 39, base_y - 88, cx - 19, base_y - 76),
+        fill="#F3A3AA"
+    )
+    draw.ellipse(
+        (cx + 19, base_y - 88, cx + 39, base_y - 76),
+        fill="#F3A3AA"
+    )
+    draw.arc(
+        (cx - 8, base_y - 91, cx + 8, base_y - 81),
+        10, 170, fill="#A65F63", width=2
+    )
+
+
 @st.cache_data(show_spinner=False)
-def draw_library(position):
-    """배경과 캐릭터를 합친 도서관 이미지 생성(Pillow만 사용)."""
-    width, height = 1170, 465
-    img = Image.new("RGB", (width, height), "#F2E6D5")
+def draw_shelf(zone, selected):
+    """서로 다른 디자인의 서가를 그린다."""
+    w, h = 360, 365
+    walls = ["#FFF1E2", "#E7F4EE", "#F0E9F8"]
+    accents = ["#B78366", "#559C91", "#8E75B4"]
+    wood = ["#9C6D55", "#547E78", "#7C6796"]
+    colors = [
+        "#DDA88B", "#7DADD1", "#E4C57E",
+        "#B39AD5", "#8CC3AD"
+    ]
+
+    img = Image.new("RGB", (w, h), walls[zone])
     d = ImageDraw.Draw(img)
-    d.rectangle((0, 0, width, 344), fill="#F0E3D1")
-    d.rectangle((0, 0, width, 25), fill="#9F7659")
-    d.rectangle((0, 344, width, height), fill="#D5B99A")
-    for x in range(0, width, 90):
-        d.line((x, 344, x + 55, height), fill="#B99D82", width=2)
-    d.line((0, 344, width, 344), fill="#96735B", width=7)
+    d.rectangle((0, 291, w, h), fill="#E4D8CB")
+    d.line((0, 292, w, 292), fill="#BCA99C", width=4)
 
-    centers = [200, 585, 970]
-    shelf_tints = ["#9D6E56", "#648D89", "#85709C"]
-    spine_colors = ["#C69271", "#628DA6", "#B0A66D", "#997DA8", "#7B9E7D"]
-    for idx, cx in enumerate(centers):
-        x0, x1 = cx - 158, cx + 158
-        d.rounded_rectangle((x0, 121, x1, 341), radius=10, fill="#946E50", outline="#6E4B37", width=5)
-        d.rectangle((x0 + 15, 136, x1 - 15, 328), fill="#5B4537")
-        for row, sy in enumerate((148, 207, 267)):
-            for j in range(12):
-                sx = x0 + 23 + 23 * j
-                bh = 32 + (j * 5 + row * 2) % 13
-                d.rectangle((sx, sy + 43 - bh, sx + 15, sy + 43), fill=spine_colors[(j + row) % len(spine_colors)])
-            d.rectangle((x0 + 11, sy + 43, x1 - 11, sy + 51), fill="#B18560")
-        d.rounded_rectangle((cx - 119, 57, cx + 119, 111), radius=17, fill="#FFF9ED", outline=shelf_tints[idx], width=4)
-        draw_center(d, STATIONS[idx], cx, 62, korean_font(29), shelf_tints[idx])
-        if position == idx:
-            d.rounded_rectangle((x0 - 2, 119, x1 + 2, 342), radius=11, outline="#FFD36D", width=8)
+    # 공간마다 다른 책장 디자인
+    if zone == 0:
+        d.rounded_rectangle(
+            (32, 40, 329, 290), radius=23,
+            fill=wood[zone], outline="#6B4B3B", width=5
+        )
+        d.rounded_rectangle(
+            (49, 64, 311, 277), radius=10,
+            fill="#F9E7C9"
+        )
+    elif zone == 1:
+        d.rounded_rectangle(
+            (24, 50, 336, 291), radius=55,
+            fill=wood[zone], outline="#2D685F", width=5
+        )
+        d.rounded_rectangle(
+            (45, 72, 316, 275), radius=38,
+            fill="#D7F0E7"
+        )
+    else:
+        d.rounded_rectangle(
+            (32, 50, 328, 291), radius=8,
+            fill=wood[zone], outline="#594578", width=5
+        )
+        d.polygon(
+            [(32, 50), (60, 20), (300, 20), (328, 50)],
+            fill="#AB95C7"
+        )
+        d.rectangle(
+            (48, 69, 312, 275), fill="#F7EDFB"
+        )
 
-    # 캐릭터의 위치는 서가 선택에 따라 변경된다.
-    cx = centers[position]
-    d.ellipse((cx - 40, 433, cx + 40, 448), fill="#B5A18D")
-    d.line((cx - 14, 408, cx - 18, 438), fill="#394A5D", width=13)
-    d.line((cx + 14, 408, cx + 18, 438), fill="#394A5D", width=13)
-    d.rounded_rectangle((cx - 32, 361, cx + 32, 417), radius=15, fill="#5681A3")
-    d.line((cx - 31, 376, cx - 51, 407), fill="#F0C6A2", width=11)
-    d.line((cx + 31, 376, cx + 51, 407), fill="#F0C6A2", width=11)
-    d.ellipse((cx - 29, 304, cx + 29, 365), fill="#F0C6A2")
-    d.pieslice((cx - 31, 298, cx + 31, 357), 170, 365, fill="#514039")
-    d.ellipse((cx - 13, 335, cx - 9, 339), fill="#34303A")
-    d.ellipse((cx + 9, 335, cx + 13, 339), fill="#34303A")
-    d.arc((cx - 10, 343, cx + 10, 352), 0, 180, fill="#9B6A5C", width=2)
-    d.rounded_rectangle((cx - 80, 445, cx + 80, 464), radius=7, fill="#F6F0E6")
-    draw_center(d, "현재 위치", cx, 446, korean_font(14), "#39546A")
+    for row, y in enumerate((95, 164, 232)):
+        for j in range(10):
+            x = 58 + j * 25
+            height = 31 + (j * 3 + row * 7) % 15
+            tilt = (j + row) % 3
+            col = colors[
+                (zone + j + row) % len(colors)
+            ]
+            d.rounded_rectangle(
+                (x, y + 42 - height, x + 17 - tilt, y + 42),
+                radius=2, fill=col,
+                outline="#887A74", width=1
+            )
+            d.line(
+                (x + 4, y + 39 - height, x + 4, y + 34 - height),
+                fill="#FFF6E8", width=2
+            )
+
+        d.rounded_rectangle(
+            (45, y + 42, 314, y + 51),
+            radius=2, fill=accents[zone]
+        )
+
+    # 책장별 장식
+    if zone == 0:
+        d.ellipse(
+            (23, 254, 53, 283), fill="#8EA883"
+        )
+        d.rectangle(
+            (31, 273, 48, 293), fill="#BB8B66"
+        )
+    elif zone == 1:
+        d.ellipse(
+            (18, 257, 48, 286), fill="#82BB9A"
+        )
+        d.ellipse(
+            (310, 246, 342, 280), fill="#9FD0AB"
+        )
+        d.rectangle(
+            (20, 275, 46, 293), fill="#CF9B7B"
+        )
+    else:
+        d.ellipse(
+            (17, 250, 49, 282), fill="#D6ABC7"
+        )
+        d.ellipse(
+            (312, 248, 344, 281), fill="#D6ABC7"
+        )
+        d.ellipse(
+            (161, 25, 200, 60), fill="#F0C96C"
+        )
+
+    if selected:
+        d.rounded_rectangle(
+            (5, 5, 355, 359),
+            radius=22, outline="#F0BC49", width=8
+        )
+        cute_character(d, 184, 350)
+    else:
+        d.ellipse(
+            (165, 315, 195, 345), fill="#E2D9D1"
+        )
+        d.ellipse(
+            (171, 320, 189, 338), fill=accents[zone]
+        )
+
     return img
 
 
-def make_bookmark(title, author, quote, palette_name):
-    """직접 쓴 문장으로 책갈피 PNG 파일을 만든다."""
-    bg, accent, ink = PALETTES[palette_name]
-    w, h = 540, 900
-    img = Image.new("RGB", (w, h), bg)
+def create_bookmark(title, author, quote, theme):
+    bg, accent, ink = THEMES[theme]
+
+    img = Image.new("RGB", (540, 900), bg)
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle((22, 22, w - 22, h - 22), radius=25, outline=accent, width=5)
-    draw_center(d, "MY BOOKMARK", w // 2, 80, korean_font(27), accent)
-    d.line((80, 140, w - 80, 140), fill=accent, width=3)
 
-    title_font = korean_font(35)
-    for n, line in enumerate(wrap_pixels(d, title, title_font, 410)[:3]):
-        draw_center(d, line, w // 2, 186 + n * 54, title_font, ink)
+    d.rounded_rectangle(
+        (22, 22, 518, 878),
+        radius=23, outline=accent, width=5
+    )
+    d.line(
+        (74, 142, 466, 142),
+        fill=accent, width=3
+    )
+
+    centered_text(
+        d, "MY BOOKMARK", 270, 75,
+        korean_font(28), accent
+    )
+
+    title_lines = text_lines(
+        d, title, korean_font(36), 425
+    )
+    if len(title_lines) > 3:
+        raise ValueError("책 제목이 너무 깁니다.")
+
+    for n, line in enumerate(title_lines):
+        centered_text(
+            d, line, 270, 180 + n * 53,
+            korean_font(36), ink
+        )
+
     if author:
-        draw_center(d, author[:25], w // 2, 352, korean_font(20), accent)
+        author_lines = text_lines(
+            d, author, korean_font(21), 415
+        )
+        for n, line in enumerate(author_lines[:2]):
+            centered_text(
+                d, line, 270, 355 + n * 30,
+                korean_font(21), accent
+            )
 
-    body_font = korean_font(29)
-    quote_lines = wrap_pixels(d, quote, body_font, 390)
+    quote_lines = text_lines(
+        d, quote, korean_font(29), 400
+    )
     if len(quote_lines) > 7:
-        raise ValueError("책갈피 문장이 너무 깁니다. 7줄 이내로 줄여 주세요.")
-    start_y = 500 - len(quote_lines) * 24
+        raise ValueError(
+            "책갈피 문장이 너무 깁니다. 조금 줄여 주세요."
+        )
+
+    start_y = 515 - len(quote_lines) * 25
     for n, line in enumerate(quote_lines):
-        draw_center(d, line, w // 2, start_y + n * 49, body_font, ink)
-    d.line((80, 797, w - 80, 797), fill=accent, width=3)
-    draw_center(d, "책모아 도서관", w // 2, 822, korean_font(24), accent)
+        centered_text(
+            d, line, 270, start_y + n * 52,
+            korean_font(29), ink
+        )
+
+    d.line(
+        (74, 796, 466, 796),
+        fill=accent, width=3
+    )
+    centered_text(
+        d, "책모아 도서관", 270, 824,
+        korean_font(24), accent
+    )
 
     output = BytesIO()
     img.save(output, format="PNG")
     return output.getvalue()
 
 
-def book_key(title, author):
-    return title.strip().casefold() + "|" + author.strip().casefold()
-
-
-def init_state():
+# ────────── 초기 상태 / 사이드바 ──────────
+def initialize_state():
     defaults = {
-        "bm_pos": 0,
+        "bm_position": 0,
         "bm_active": None,
         "bm_books": {},
-        "bm_current": None,
         "bm_reviews": {},
         "bm_reports": {},
-        "bm_bookmark_png": None,
+        "bm_current": None,
+        "bm_png": None,
+        "bm_user_id": None,
+        "bm_username": None,
     }
+
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
 
 
-def make_report(book, record):
-    return (f"[{book['title']}] 독후감\n저자: {book['author']}\n\n"
-            f"1. 읽게 된 이유\n{record['reason']}\n\n"
-            f"2. 인상 깊었던 내용\n{record['scene']}\n\n"
-            f"3. 읽고 난 뒤의 생각\n{record['thought']}")
+def book_key(title, author):
+    return (
+        title.strip().casefold()
+        + "|"
+        + author.strip().casefold()
+    )
 
 
-def export_records():
-    return json.dumps({
-        "version": 1,
-        "books": st.session_state.bm_books,
-        "current": st.session_state.bm_current,
-        "reviews": st.session_state.bm_reviews,
-        "reports": st.session_state.bm_reports,
-    }, ensure_ascii=False, indent=2).encode("utf-8-sig")
+init_db()
+initialize_state()
+
+with st.sidebar:
+    st.title("📚 책모아")
+    st.markdown("#### 페이지 이동")
+
+    # 실제 존재하는 페이지 파일을 찾아 연결
+    st.page_link(
+        "main.py",
+        label="🏠 MAIN · 도서관"
+    )
+
+    page_dir = ROOT / "pages"
+    page_files = (
+        sorted(page_dir.glob("*.py"))
+        if page_dir.exists()
+        else []
+    )
+
+    shortform_page = next(
+        (
+            p for p in page_files
+            if "숏폼" in p.name
+            or "shortform" in p.name.lower()
+        ),
+        None,
+    )
+
+    if shortform_page:
+        st.page_link(
+            f"pages/{shortform_page.name}",
+            label="🎮 PAGE 1 · 숏폼 브레이커"
+        )
+    else:
+        st.warning(
+            "PAGE 1 파일을 pages 폴더에서 찾지 못했습니다."
+        )
+
+    escape_page = next(
+        (
+            p for p in page_files
+            if "탈출" in p.name
+            or "escape" in p.name.lower()
+        ),
+        None,
+    )
+
+    if escape_page:
+        st.page_link(
+            f"pages/{escape_page.name}",
+            label="🗝️ PAGE 2 · 책 속 탈출"
+        )
+
+    st.divider()
+    st.markdown("#### 👤 내 기록")
+
+    if st.session_state.bm_user_id is not None:
+        st.success(
+            f"{st.session_state.bm_username}님 로그인 중"
+        )
+
+        if st.button(
+            "로그아웃",
+            use_container_width=True
+        ):
+            st.session_state.bm_user_id = None
+            st.session_state.bm_username = None
+            st.session_state.bm_books = {}
+            st.session_state.bm_reviews = {}
+            st.session_state.bm_reports = {}
+            st.session_state.bm_current = None
+            st.session_state.bm_png = None
+            st.rerun()
+
+    else:
+        login_tab, signup_tab = st.tabs(
+            ["로그인", "회원가입"]
+        )
+
+        with login_tab:
+            with st.form("bm_login_form"):
+                login_name = st.text_input("아이디")
+                login_pw = st.text_input(
+                    "비밀번호",
+                    type="password"
+                )
+                login_submit = st.form_submit_button(
+                    "로그인",
+                    use_container_width=True
+                )
+
+            if login_submit:
+                user_id = authenticate(
+                    login_name.strip(), login_pw
+                )
+                if user_id is None:
+                    st.error(
+                        "아이디 또는 비밀번호를 확인해 주세요."
+                    )
+                else:
+                    st.session_state.bm_user_id = user_id
+                    st.session_state.bm_username = (
+                        login_name.strip()
+                    )
+                    load_records(user_id)
+                    st.rerun()
+
+        with signup_tab:
+            with st.form("bm_signup_form"):
+                new_name = st.text_input(
+                    "새 아이디 (영문·숫자·_)"
+                )
+                new_pw = st.text_input(
+                    "새 비밀번호 (8자 이상)",
+                    type="password"
+                )
+                new_pw_confirm = st.text_input(
+                    "비밀번호 확인",
+                    type="password"
+                )
+                signup_submit = st.form_submit_button(
+                    "회원가입",
+                    use_container_width=True
+                )
+
+            if signup_submit:
+                if new_pw != new_pw_confirm:
+                    st.error(
+                        "비밀번호가 일치하지 않습니다."
+                    )
+                else:
+                    message = register_user(
+                        new_name.strip(), new_pw
+                    )
+                    if message:
+                        st.error(message)
+                    else:
+                        st.success(
+                            "가입 완료! 로그인 탭에서 로그인해 주세요."
+                        )
+
+        st.caption(
+            "로그인하지 않아도 체험할 수 있지만 "
+            "기록은 현재 접속 중에만 유지됩니다."
+        )
+
+    st.caption(
+        "학습용 로컬 DB입니다. 클라우드 서버가 "
+        "재시작되면 계정과 기록이 사라질 수 있습니다."
+    )
 
 
-def import_records(data):
-    if not isinstance(data, dict) or data.get("version") != 1:
-        raise ValueError("책모아 기록 파일 형식이 아닙니다.")
-    books, reviews, reports = (data.get(x) for x in ("books", "reviews", "reports"))
-    if not isinstance(books, dict) or not isinstance(reviews, dict) or not isinstance(reports, dict):
-        raise ValueError("필수 기록 항목이 없습니다.")
-    if len(books) > 100:
-        raise ValueError("도서 수가 너무 많습니다.")
-    valid_books = {}
-    for key, value in books.items():
-        if not isinstance(key, str) or not isinstance(value, dict):
-            continue
-        title, author = value.get("title"), value.get("author")
-        if not isinstance(title, str) or not isinstance(author, str):
-            continue
-        if title.strip() and len(title) <= 100 and len(author) <= 70:
-            valid_books[key] = {"title": title, "author": author}
-    st.session_state.bm_books = valid_books
-    st.session_state.bm_reviews = {
-        key: value for key, value in reviews.items()
-        if key in valid_books and isinstance(value, dict)
-        and isinstance(value.get("text"), str)
-        and isinstance(value.get("rating"), int)
-        and 1 <= value["rating"] <= 5
-        and len(value["text"]) <= 100
-    }
-    st.session_state.bm_reports = {
-        key: value for key, value in reports.items()
-        if key in valid_books and isinstance(value, dict)
-        and all(isinstance(value.get(f), str) and len(value[f]) <= 5000
-                for f in ("reason", "scene", "thought"))
-    }
-    current = data.get("current")
-    st.session_state.bm_current = current if current in valid_books else None
-    st.session_state.bm_bookmark_png = None
+# ────────── 메인 화면 ──────────
+st.title("📖 책모아 도서관")
 
+st.caption(
+    "책장 사이를 이동하며 책에 대한 생각을 기록하고 "
+    "나만의 책갈피를 만들어 보세요."
+)
 
-# ────────────────── 화면 시작 ──────────────────
-init_state()
-st.title("📚 책모아 도서관")
-st.caption("캐릭터를 이동해 한줄평·독후감·책갈피 공간을 체험하세요. (API 없이 실행)")
+st.markdown("### 🏛️ 도서관 둘러보기")
 
-# PAGE 1은 pages 폴더에 있는 기존 코드를 Streamlit이 자동 인식합니다.
-# 메인에서 별도의 page_link는 호출하지 않습니다.
-st.caption("🎮 PAGE 1: 숏폼 브레이커는 기본 페이지 메뉴에서 이동하세요.")
-st.image(draw_library(st.session_state.bm_pos), use_container_width=True)
+columns = st.columns(3, gap="small")
 
-left, enter, right = st.columns([1, 2, 1])
+for index, col in enumerate(columns):
+    with col:
+        # 한글 제목은 Streamlit 글자로 출력
+        st.markdown(
+            f"#### {ICONS[index]} {ZONES[index]} 공간"
+        )
+        st.image(
+            draw_shelf(
+                index,
+                st.session_state.bm_position == index
+            ),
+            use_container_width=True
+        )
+
+left, center, right = st.columns([1, 2, 1])
+
 with left:
-    if st.button("◀ 왼쪽", disabled=st.session_state.bm_pos == 0, use_container_width=True):
-        st.session_state.bm_pos -= 1
-        st.session_state.bm_active = None
-        st.rerun()
-with enter:
-    if st.button(f"🚪 {STATIONS[st.session_state.bm_pos]} 공간 입장", type="primary", use_container_width=True):
-        st.session_state.bm_active = st.session_state.bm_pos
-        st.rerun()
-with right:
-    if st.button("오른쪽 ▶", disabled=st.session_state.bm_pos == 2, use_container_width=True):
-        st.session_state.bm_pos += 1
+    if st.button(
+        "◀ 왼쪽 이동",
+        disabled=st.session_state.bm_position == 0,
+        use_container_width=True
+    ):
+        st.session_state.bm_position -= 1
         st.session_state.bm_active = None
         st.rerun()
 
+with center:
+    current_zone = ZONES[
+        st.session_state.bm_position
+    ]
+
+    if st.button(
+        f"🚪 {current_zone} 공간 입장",
+        type="primary",
+        use_container_width=True
+    ):
+        st.session_state.bm_active = (
+            st.session_state.bm_position
+        )
+        st.rerun()
+
+with right:
+    if st.button(
+        "오른쪽 이동 ▶",
+        disabled=st.session_state.bm_position == 2,
+        use_container_width=True
+    ):
+        st.session_state.bm_position += 1
+        st.session_state.bm_active = None
+        st.rerun()
+
+
+# ────────── 책 선택 ──────────
 st.divider()
-st.subheader("📖 활동할 책 선택")
-with st.form("add_book", clear_on_submit=True):
-    col1, col2 = st.columns(2)
-    title = col1.text_input("책 제목 *", max_chars=100)
-    author = col2.text_input("저자(선택)", max_chars=70)
-    add_book = st.form_submit_button("이 책으로 활동하기")
-if add_book:
+st.subheader("📘 활동할 책 선택")
+
+with st.form(
+    "bm_book_form",
+    clear_on_submit=True
+):
+    col_title, col_author = st.columns(2)
+
+    title = col_title.text_input(
+        "책 제목 *",
+        max_chars=100
+    )
+    author = col_author.text_input(
+        "저자 (선택)",
+        max_chars=70
+    )
+
+    submitted_book = st.form_submit_button(
+        "이 책으로 활동하기"
+    )
+
+if submitted_book:
     if not title.strip():
         st.warning("책 제목을 입력해 주세요.")
     else:
         key = book_key(title, author)
-        st.session_state.bm_books[key] = {"title": title.strip(), "author": author.strip()}
+
+        book = {
+            "title": title.strip(),
+            "author": author.strip()
+        }
+
+        st.session_state.bm_books[key] = book
         st.session_state.bm_current = key
-        st.session_state.bm_bookmark_png = None
+        st.session_state.bm_png = None
+
+        save_book(
+            st.session_state.bm_user_id,
+            key,
+            book["title"],
+            book["author"]
+        )
         st.rerun()
 
 if st.session_state.bm_books:
-    ids = list(st.session_state.bm_books)
-    current_id = st.session_state.bm_current
-    selected_id = st.selectbox(
-        "이전에 등록한 책 선택",
-        ids,
-        index=ids.index(current_id) if current_id in ids else 0,
-        format_func=lambda k: st.session_state.bm_books[k]["title"],
+    book_ids = list(st.session_state.bm_books)
+
+    selected = st.selectbox(
+        "등록한 책 목록",
+        book_ids,
+        index=(
+            book_ids.index(
+                st.session_state.bm_current
+            )
+            if st.session_state.bm_current in book_ids
+            else 0
+        ),
+        format_func=lambda key: (
+            st.session_state.bm_books[key]["title"]
+        ),
     )
-    if selected_id != current_id:
-        if st.button("선택한 책으로 변경하기"):
-            st.session_state.bm_current = selected_id
-            st.session_state.bm_bookmark_png = None
+
+    if selected != st.session_state.bm_current:
+        if st.button(
+            "이 책 선택",
+            use_container_width=True
+        ):
+            st.session_state.bm_current = selected
+            st.session_state.bm_png = None
             st.rerun()
 else:
-    st.info("책 제목을 먼저 등록해 주세요. 고정된 테마별 도서 목록과 API 검색은 없습니다.")
+    st.info(
+        "책 제목을 입력하면 한줄평·독후감·책갈피를 "
+        "만들 수 있습니다."
+    )
 
-current_id = st.session_state.bm_current
-book = st.session_state.bm_books.get(current_id) if current_id else None
-if st.session_state.bm_active is None:
-    st.info("캐릭터를 이동한 뒤 '공간 입장'을 눌러 활동을 시작하세요.")
+book_id = st.session_state.bm_current
+book = (
+    st.session_state.bm_books.get(book_id)
+    if book_id else None
+)
+active = st.session_state.bm_active
+user_id = st.session_state.bm_user_id
+
+
+# ────────── 공간별 기능 ──────────
+if active is None:
+    st.info(
+        "캐릭터를 움직이고 '공간 입장'을 누르면 "
+        "해당 활동이 열립니다."
+    )
+
 elif book is None:
-    st.info("위에서 활동할 책을 등록하면 선택한 공간을 이용할 수 있습니다.")
+    st.info("먼저 활동할 책을 등록해 주세요.")
+
 else:
     st.divider()
-    st.subheader(f"✏️ {STATIONS[st.session_state.bm_active]} · {book['title']}")
-    if st.session_state.bm_active == 0:
-        saved = st.session_state.bm_reviews.get(current_id, {})
-        with st.form(f"review_{current_id}"):
-            rating = st.slider("별점", 1, 5, int(saved.get("rating", 3)))
-            review_text = st.text_area("한줄평 (10~100자)", value=saved.get("text", ""), height=100)
-            save_review = st.form_submit_button("한줄평 저장", type="primary")
-        if save_review:
-            clean = review_text.strip()
-            if not 10 <= len(clean) <= 100:
-                st.warning("한줄평은 10~100자 사이로 작성해 주세요.")
-            else:
-                st.session_state.bm_reviews[current_id] = {"rating": rating, "text": clean}
-                st.success("한줄평을 저장했습니다.")
-                st.rerun()
-        if saved:
-            st.success("⭐" * saved["rating"] + "  " + saved["text"])
-            if st.button("한줄평 삭제"):
-                st.session_state.bm_reviews.pop(current_id, None)
-                st.rerun()
+    st.subheader(
+        f"{ICONS[active]} "
+        f"{ZONES[active]} · {book['title']}"
+    )
 
-    elif st.session_state.bm_active == 1:
-        saved = st.session_state.bm_reports.get(current_id, {})
-        with st.form(f"report_{current_id}"):
-            reason = st.text_area("1. 책을 읽게 된 이유", value=saved.get("reason", ""), height=95)
-            scene = st.text_area("2. 인상 깊었던 내용", value=saved.get("scene", ""), height=100)
-            thought = st.text_area("3. 읽고 난 뒤의 생각", value=saved.get("thought", ""), height=100)
-            save_report = st.form_submit_button("독후감 저장", type="primary")
-        if save_report:
-            if not all(x.strip() for x in (reason, scene, thought)):
-                st.warning("세 항목을 모두 작성해 주세요.")
+    # 1. 한줄평 작성
+    if active == 0:
+        saved = st.session_state.bm_reviews.get(
+            book_id, {}
+        )
+
+        with st.form(f"bm_review_{book_id}"):
+            rating = st.slider(
+                "별점",
+                1, 5,
+                value=saved.get("rating", 3)
+            )
+
+            content = st.text_area(
+                "한줄평 (10~100자)",
+                value=saved.get("text", ""),
+                max_chars=100
+            )
+
+            save_clicked = st.form_submit_button(
+                "한줄평 저장",
+                type="primary"
+            )
+
+        if save_clicked:
+            if len(content.strip()) < 10:
+                st.warning(
+                    "한줄평은 10자 이상 작성해 주세요."
+                )
             else:
-                st.session_state.bm_reports[current_id] = {
-                    "reason": reason.strip(), "scene": scene.strip(), "thought": thought.strip()
+                st.session_state.bm_reviews[book_id] = {
+                    "rating": rating,
+                    "text": content.strip()
                 }
-                st.success("독후감을 저장했습니다.")
-                st.rerun()
-        if saved:
-            full_text = make_report(book, saved)
-            st.text_area("저장된 독후감 미리보기", full_text, height=260, disabled=True)
-            st.download_button("독후감 TXT 다운로드", full_text.encode("utf-8-sig"),
-                               file_name="bookmoa_report.txt", mime="text/plain")
-            if st.button("독후감 삭제"):
-                st.session_state.bm_reports.pop(current_id, None)
+
+                save_review(
+                    user_id,
+                    book_id,
+                    rating,
+                    content.strip()
+                )
                 st.rerun()
 
-    elif st.session_state.bm_active == 2:
-        review = st.session_state.bm_reviews.get(current_id, {}).get("text", "")
-        quote = st.text_area("책갈피 문장 (직접 작성 가능)", value=review,
-                             max_chars=100, key=f"quote_{current_id}")
-        design = st.selectbox("디자인 색상", list(PALETTES), key="bm_palette")
-        if st.button("책갈피 PNG 만들기", type="primary"):
+        if saved:
+            st.success(
+                "⭐" * saved["rating"]
+                + " "
+                + saved["text"]
+            )
+
+            if st.button("한줄평 삭제"):
+                st.session_state.bm_reviews.pop(
+                    book_id, None
+                )
+                delete_record(
+                    "reviews", user_id, book_id
+                )
+                st.rerun()
+
+    # 2. 독후감 작성
+    elif active == 1:
+        saved = st.session_state.bm_reports.get(
+            book_id, {}
+        )
+
+        with st.form(f"bm_report_{book_id}"):
+            reason = st.text_area(
+                "1. 읽게 된 이유",
+                value=saved.get("reason", ""),
+                height=100
+            )
+
+            scene = st.text_area(
+                "2. 인상 깊었던 내용",
+                value=saved.get("scene", ""),
+                height=115
+            )
+
+            thought = st.text_area(
+                "3. 읽고 난 뒤의 생각",
+                value=saved.get("thought", ""),
+                height=115
+            )
+
+            save_clicked = st.form_submit_button(
+                "독후감 저장",
+                type="primary"
+            )
+
+        if save_clicked:
+            if not all(
+                part.strip()
+                for part in (reason, scene, thought)
+            ):
+                st.warning(
+                    "세 항목을 모두 작성해 주세요."
+                )
+            else:
+                clean = {
+                    "reason": reason.strip(),
+                    "scene": scene.strip(),
+                    "thought": thought.strip()
+                }
+
+                st.session_state.bm_reports[
+                    book_id
+                ] = clean
+
+                save_report(
+                    user_id, book_id, **clean
+                )
+                st.rerun()
+
+        if saved:
+            full_text = (
+                f"[{book['title']}] 독후감\n\n"
+                f"1. 읽게 된 이유\n"
+                f"{saved['reason']}\n\n"
+                f"2. 인상 깊었던 내용\n"
+                f"{saved['scene']}\n\n"
+                f"3. 읽고 난 뒤의 생각\n"
+                f"{saved['thought']}"
+            )
+
+            st.text_area(
+                "저장된 독후감",
+                value=full_text,
+                height=250,
+                disabled=True
+            )
+
+            st.download_button(
+                "📥 독후감 TXT 다운로드",
+                full_text.encode("utf-8-sig"),
+                file_name="bookmoa_report.txt",
+                mime="text/plain"
+            )
+
+            if st.button("독후감 삭제"):
+                st.session_state.bm_reports.pop(
+                    book_id, None
+                )
+                delete_record(
+                    "reports", user_id, book_id
+                )
+                st.rerun()
+
+    # 3. 책갈피 생성
+    elif active == 2:
+        review_text = (
+            st.session_state.bm_reviews
+            .get(book_id, {})
+            .get("text", "")
+        )
+
+        quote = st.text_area(
+            "책갈피에 넣을 문장",
+            value=review_text,
+            max_chars=100,
+            key=f"bm_quote_{book_id}"
+        )
+
+        theme = st.selectbox(
+            "디자인",
+            list(THEMES),
+            key="bm_theme"
+        )
+
+        if st.button(
+            "책갈피 PNG 만들기",
+            type="primary"
+        ):
             if not quote.strip():
-                st.warning("책갈피에 넣을 문장을 작성해 주세요.")
+                st.warning(
+                    "책갈피에 넣을 문장을 작성해 주세요."
+                )
             else:
                 try:
-                    st.session_state.bm_bookmark_png = make_bookmark(
-                        book["title"], book["author"], quote.strip(), design
+                    st.session_state.bm_png = (
+                        create_bookmark(
+                            book["title"],
+                            book["author"],
+                            quote.strip(),
+                            theme
+                        )
                     )
                     st.rerun()
                 except ValueError as exc:
-                    st.warning(str(exc))
-        if st.session_state.bm_bookmark_png is not None:
-            st.image(st.session_state.bm_bookmark_png, width=260)
-            st.download_button("📥 PNG 다운로드", data=st.session_state.bm_bookmark_png,
-                               file_name="bookmoa_bookmark.png", mime="image/png")
+                    st.error(str(exc))
 
+        if st.session_state.bm_png:
+            st.image(
+                st.session_state.bm_png,
+                width=280
+            )
+
+            st.download_button(
+                "📥 책갈피 PNG 다운로드",
+                st.session_state.bm_png,
+                file_name="bookmoa_bookmark.png",
+                mime="image/png"
+            )
+
+
+# ────────── 독서 기록 조회 ──────────
 st.divider()
-with st.expander("💾 내 기록 저장 / 불러오기 (로그인 없음)"):
-    st.caption("작성 내용은 현재 세션에서 유지됩니다. 나중에 이어 하려면 JSON을 다운로드하고 다음에 다시 불러오세요.")
-    st.download_button("기록 JSON 다운로드", export_records(),
-                       file_name="bookmoa_records.json", mime="application/json")
-    uploaded = st.file_uploader("기록 파일 선택", type=["json"])
-    if uploaded is not None and st.button("저장된 기록 불러오기"):
-        try:
-            if len(uploaded.getvalue()) > 500_000:
-                raise ValueError("500KB 이하의 파일을 선택해 주세요.")
-            raw = uploaded.getvalue().decode("utf-8-sig")
-            import_records(json.loads(raw))
-            st.success("기록을 불러왔습니다.")
-            st.rerun()
-        except (ValueError, UnicodeError, json.JSONDecodeError, TypeError) as exc:
-            st.error(f"기록 파일을 확인해 주세요: {exc}")
 
-st.caption("MAIN 도서관 | PAGE 1 숏폼 브레이커")
+with st.expander("📒 내 독서 기록 보기"):
+    if not st.session_state.bm_books:
+        st.write("아직 등록한 책이 없습니다.")
+    else:
+        for key, entry in (
+            st.session_state.bm_books.items()
+        ):
+            st.markdown(
+                f"**📖 {entry['title']}**"
+            )
+
+            if key in st.session_state.bm_reviews:
+                item = (
+                    st.session_state
+                    .bm_reviews[key]
+                )
+
+                st.write(
+                    "⭐" * item["rating"],
+                    item["text"]
+                )
+
+            if key in st.session_state.bm_reports:
+                st.write("📝 독후감 저장 완료")
+
+    if user_id is None:
+        st.caption(
+            "로그인하지 않은 기록은 브라우저 "
+            "세션 종료 후 유지되지 않습니다."
+        )
+    else:
+        st.caption(
+            "로그인한 계정의 기록입니다. "
+            "현재 서버의 로컬 DB에 저장됩니다."
+        )
